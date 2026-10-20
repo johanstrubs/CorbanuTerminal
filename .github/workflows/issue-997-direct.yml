@@ -1,8 +1,6 @@
-name: Temporary issue 997 direct binary stress
+name: Bounded issue 997 reproduction
 
 on:
-  push:
-    branches: [qa-issue-997-direct]
   workflow_dispatch:
 
 permissions:
@@ -11,7 +9,7 @@ permissions:
 jobs:
   reproduce:
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: codex-rs
@@ -21,65 +19,75 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: 7e66e5a4dc
           persist-credentials: false
       - uses: ./.github/actions/setup-ci
       - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
           tool: cargo-nextest@0.9.148
-      - name: Compile test and record environment
+      - name: Record environment and compile
         shell: bash
         run: |
           set -euo pipefail
-          { git rev-parse HEAD; rustc --version; cargo --version; cargo nextest --version; sysctl -n hw.logicalcpu; } > "$RUNNER_TEMP/issue-997-environment.txt"
-          just test -p codex-core --lib -E 'test(issue_621_622_interpreter_denials_are_explained_and_listed)' --retries 0
-      - name: Run focused test binary repeatedly with concurrent CPU load
+          {
+            git rev-parse HEAD
+            rustc --version
+            cargo --version
+            cargo nextest --version
+            printf 'logical CPUs: '
+            sysctl -n hw.logicalcpu
+          } | tee "$RUNNER_TEMP/issue-997-environment.txt"
+          just test -p codex-core --lib --features developer-accounting \
+            -E 'test(issue_621_622_interpreter_denials_are_explained_and_listed)' \
+            --retries 0
+      - name: Run at most three reported concurrent suites
         shell: bash
         run: |
           set -euo pipefail
           target='security::protected_reads::tests::issue_621_622_interpreter_denials_are_explained_and_listed'
-          binary=''
-          while IFS= read -r candidate; do
-            if "$candidate" --list 2>/dev/null | grep -Fq "$target: test"; then binary="$candidate"; break; fi
-          done < <(find target/debug/deps -maxdepth 1 -type f -name 'codex_core-*' -perm -111)
-          test -n "$binary"
-          printf 'test binary: %s\n' "$binary"
-          count=0
-          pids=()
+          command="just test -p codex-core --lib --features developer-accounting -E 'test(security::) | test(network_approval) | test(mcp_tool_call) | test(session::tests::)' --retries 0"
+          load_pid=''
           cleanup() {
-            for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
-            pids=()
+            if [[ -n "$load_pid" ]]; then kill "$load_pid" 2>/dev/null || true; fi
           }
           trap cleanup EXIT
-          for factor in 1 2 4; do
-            workers=$(( $(sysctl -n hw.logicalcpu) * factor ))
-            for ((j=0; j<workers; j++)); do
-              (while :; do :; done) &
-              pids+=("$!")
-            done
-            printf 'load factor=%d workers=%d\n' "$factor" "$workers"
-            for ((run=1; run<=250; run++)); do
-              count=$((count+1))
-              set +e
-              { printf '+ %s --exact %s --nocapture --test-threads=1\n' "$binary" "$target"; "$binary" --exact "$target" --nocapture --test-threads=1; } 2>&1 | tee "$RUNNER_TEMP/issue-997-last.log"
-              result=${PIPESTATUS[0]}
-              set -e
-              if ((result != 0)); then
-                cp "$RUNNER_TEMP/issue-997-last.log" "$RUNNER_TEMP/issue-997-first-failure.log"
-                printf 'first failure on run %d (factor %d, workers %d, exit %d)\n' "$count" "$factor" "$workers" "$result" | tee "$RUNNER_TEMP/issue-997-result.txt"
-                exit 0
-              fi
-            done
-            cleanup
+          (while :; do :; done) &
+          load_pid=$!
+          printf 'background CPU workers: 1\n' | tee "$RUNNER_TEMP/issue-997-result.txt"
+          for run in 1 2 3; do
+            log="$RUNNER_TEMP/issue-997-run-$run.log"
+            set +e
+            { printf '+ %s\n' "$command"; just test -p codex-core --lib \
+                --features developer-accounting \
+                -E 'test(security::) | test(network_approval) | test(mcp_tool_call) | test(session::tests::)' \
+                --retries 0; } 2>&1 | tee "$log"
+            result=${PIPESTATUS[0]}
+            set -e
+            if grep -F "$target" "$log" | grep -Eq 'FAIL|TIMEOUT'; then
+              cp "$log" "$RUNNER_TEMP/issue-997-first-failure.log"
+              printf 'Target first failed on suite run %d (exit %d)\n' "$run" "$result" \
+                | tee -a "$RUNNER_TEMP/issue-997-result.txt"
+              exit 0
+            fi
+            if (( result == 0 )); then
+              printf 'Suite run %d: target passed; suite passed\n' "$run" \
+                | tee -a "$RUNNER_TEMP/issue-997-result.txt"
+            else
+              printf 'Suite run %d: target passed; suite had an unrelated failure (exit %d)\n' \
+                "$run" "$result" | tee -a "$RUNNER_TEMP/issue-997-result.txt"
+            fi
           done
-          printf 'No failure after %d runs\n' "$count" | tee "$RUNNER_TEMP/issue-997-result.txt"
-      - name: Preserve result and complete raw first failure
+          printf 'Target did not fail in 3 bounded suite runs\n' \
+            | tee -a "$RUNNER_TEMP/issue-997-result.txt"
+      - name: Preserve results and complete raw target failure
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: issue-997-direct-reproduction
+          name: issue-997-bounded-reproduction
           path: |
             ${{ runner.temp }}/issue-997-environment.txt
             ${{ runner.temp }}/issue-997-result.txt
+            ${{ runner.temp }}/issue-997-run-*.log
             ${{ runner.temp }}/issue-997-first-failure.log
           if-no-files-found: warn
           retention-days: 7
