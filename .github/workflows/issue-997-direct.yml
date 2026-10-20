@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: 7e66e5a4dc
+          ref: 7e66e5a4dcd2737d2900642b2b613531916ef3b4
           persist-credentials: false
       - uses: ./.github/actions/setup-ci
       - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
