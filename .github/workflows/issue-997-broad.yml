@@ -1,0 +1,70 @@
+name: Temporary issue 997 concurrent suite reproduction
+
+on:
+  push:
+    branches: [qa-issue-997-broad]
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: macos-15
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: cargo-nextest@0.9.148
+      - name: Record environment and warm the focused test
+        shell: bash
+        run: |
+          set -euo pipefail
+          { git rev-parse HEAD; rustc --version; cargo --version; cargo nextest --version; } | tee "$RUNNER_TEMP/issue-997-metadata.txt"
+          just test -p codex-core --lib --features developer-accounting -E 'test(issue_621_622_interpreter_denials_are_explained_and_listed)' --retries 0
+      - name: Repeat issue reporter concurrent suite under CPU load
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=0
+          failed=0
+          workers=$(sysctl -n hw.logicalcpu)
+          pids=()
+          cleanup() { for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done; }
+          trap cleanup EXIT
+          for ((j=0; j<workers; j++)); do (while :; do :; done) & pids+=("$!"); done
+          printf 'workers=%d\n' "$workers"
+          for ((i=1; i<=30; i++)); do
+            count=$i
+            set +e
+            { printf '%s\n' "+ just test -p codex-core --lib --features developer-accounting -E 'test(security::) | test(network_approval) | test(mcp_tool_call) | test(session::tests::)' --retries 0"; just test -p codex-core --lib --features developer-accounting -E 'test(security::) | test(network_approval) | test(mcp_tool_call) | test(session::tests::)' --retries 0; } 2>&1 | tee "$RUNNER_TEMP/issue-997-broad-last-run.log"
+            result=${PIPESTATUS[0]}
+            set -e
+            if (( result != 0 )); then
+              cp "$RUNNER_TEMP/issue-997-broad-last-run.log" "$RUNNER_TEMP/issue-997-broad-first-failure.log"
+              printf 'first failing suite on run %d (exit %d)\n' "$count" "$result" | tee "$RUNNER_TEMP/issue-997-broad-result.txt"
+              failed=1
+              break
+            fi
+          done
+          if (( ! failed )); then printf 'No failure after %d suite runs\n' "$count" | tee "$RUNNER_TEMP/issue-997-broad-result.txt"; fi
+      - name: Preserve unedited first failure and environment
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: issue-997-broad-reproduction
+          path: |
+            ${{ runner.temp }}/issue-997-metadata.txt
+            ${{ runner.temp }}/issue-997-broad-result.txt
+            ${{ runner.temp }}/issue-997-broad-first-failure.log
+          if-no-files-found: warn
+          retention-days: 7
