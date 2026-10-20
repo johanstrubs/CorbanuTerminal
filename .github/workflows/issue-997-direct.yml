@@ -1,0 +1,83 @@
+name: Temporary issue 997 direct binary stress
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: cargo-nextest@0.9.148
+      - name: Compile test and record environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          { git rev-parse HEAD; rustc --version; cargo --version; cargo nextest --version; sysctl -n hw.logicalcpu; } > "$RUNNER_TEMP/issue-997-environment.txt"
+          just test -p codex-core --lib -E 'test(issue_621_622_interpreter_denials_are_explained_and_listed)' --retries 0
+      - name: Run focused test binary repeatedly with concurrent CPU load
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='security::protected_reads::tests::issue_621_622_interpreter_denials_are_explained_and_listed'
+          binary=''
+          while IFS= read -r candidate; do
+            if "$candidate" --list 2>/dev/null | grep -Fq "$target: test"; then binary="$candidate"; break; fi
+          done < <(find target/debug/deps -maxdepth 1 -type f -name 'codex_core-*' -perm -111)
+          test -n "$binary"
+          printf 'test binary: %s\n' "$binary"
+          count=0
+          pids=()
+          cleanup() {
+            for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+            pids=()
+          }
+          trap cleanup EXIT
+          for factor in 1 2 4; do
+            workers=$(( $(sysctl -n hw.logicalcpu) * factor ))
+            for ((j=0; j<workers; j++)); do
+              (while :; do :; done) &
+              pids+=("$!")
+            done
+            printf 'load factor=%d workers=%d\n' "$factor" "$workers"
+            for ((run=1; run<=250; run++)); do
+              count=$((count+1))
+              set +e
+              { printf '+ %s --exact %s --nocapture --test-threads=1\n' "$binary" "$target"; "$binary" --exact "$target" --nocapture --test-threads=1; } 2>&1 | tee "$RUNNER_TEMP/issue-997-last.log"
+              result=${PIPESTATUS[0]}
+              set -e
+              if ((result != 0)); then
+                cp "$RUNNER_TEMP/issue-997-last.log" "$RUNNER_TEMP/issue-997-first-failure.log"
+                printf 'first failure on run %d (factor %d, workers %d, exit %d)\n' "$count" "$factor" "$workers" "$result" | tee "$RUNNER_TEMP/issue-997-result.txt"
+                exit 0
+              fi
+            done
+            cleanup
+          done
+          printf 'No failure after %d runs\n' "$count" | tee "$RUNNER_TEMP/issue-997-result.txt"
+      - name: Preserve result and complete raw first failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: issue-997-direct-reproduction
+          path: |
+            ${{ runner.temp }}/issue-997-environment.txt
+            ${{ runner.temp }}/issue-997-result.txt
+            ${{ runner.temp }}/issue-997-first-failure.log
+          if-no-files-found: warn
+          retention-days: 7
