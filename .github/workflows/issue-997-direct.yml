@@ -1,6 +1,8 @@
 name: Temporary issue 997 direct binary stress
 
 on:
+  push:
+    branches: [qa-issue-997-direct]
   workflow_dispatch:
 
 permissions:
